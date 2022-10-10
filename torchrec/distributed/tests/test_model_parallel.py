@@ -971,6 +971,8 @@ class ModelParallelStateDictTest(unittest.TestCase):
                     )
             else:
                 src = v2
+                print("src", src)
+                print("dst", dst)
                 self.assertTrue(torch.equal(src, dst))
 
         for param_name, dst_param_group in dst_optimizer_state_dict.items():
