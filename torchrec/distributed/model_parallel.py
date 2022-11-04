@@ -7,7 +7,6 @@
 
 import abc
 import copy
-import types
 from collections import OrderedDict
 from typing import Any, cast, Dict, Iterator, List, Optional, Tuple
 
@@ -18,17 +17,18 @@ from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.planner import (
     EmbeddingShardingPlanner,
     sharder_name,
     Topology,
 )
-
 from torchrec.distributed.sharding_plan import get_default_sharders
 from torchrec.distributed.types import (
     ModuleCopyMixin,
     ModuleSharder,
     ShardedModule,
+    ShardedTensor,
     ShardingEnv,
     ShardingPlan,
 )
@@ -78,31 +78,31 @@ class DefaultDataParallelWrapper(DataParallelWrapper):
         pg = env.process_group
         if pg is None:
             raise RuntimeError("Can only init DDP for ProcessGroup-based ShardingEnv")
-        sharded_parameter_names = {
-            key
-            for key in DistributedModelParallel._sharded_parameter_names(
-                dmp._dmp_wrapped_module
-            )
+        sharded_parameter_names = set(
+            DistributedModelParallel._sharded_parameter_names(dmp._dmp_wrapped_module)
+        )
+        all_parameter_names = {
+            key for key, _ in dmp.named_parameters(include_fused=True)
         }
-        all_paramemeter_names = {key for key, _ in dmp.named_parameters()}
-        if sharded_parameter_names == all_paramemeter_names:
+        if sharded_parameter_names == all_parameter_names:
             return
 
         # pyre-fixme[16]: `DistributedDataParallel` has no attribute
         #  `_set_params_and_buffers_to_ignore_for_model`.
         DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
             module=dmp._dmp_wrapped_module,
-            params_and_buffers_to_ignore=[
-                key for key in all_paramemeter_names if key in sharded_parameter_names
-            ],
+            params_and_buffers_to_ignore=sharded_parameter_names,
         )
         # initialize DDP
+        for name, param in dmp._dmp_wrapped_module.named_parameters():
+            if name not in sharded_parameter_names:
+                param.to(device)
         dmp._dmp_wrapped_module = cast(
             nn.Module,
             # pyre-fixme[28]: Unexpected keyword argument `gradient_as_bucket_view`.
             DistributedDataParallel(
-                module=dmp._dmp_wrapped_module.to(device),
-                device_ids=None if device.type == "cpu" else [device],
+                module=dmp._dmp_wrapped_module,
+                device_ids=[device] if device.type == "gpu" else None,
                 process_group=pg,
                 gradient_as_bucket_view=True,
                 broadcast_buffers=False,
@@ -190,8 +190,9 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         super().__init__()
         torch._C._log_api_usage_once(f"torchrec.distributed.{self.__class__.__name__}")
 
-        self._dmp_wrapped_module = module
         self.init_parameters = init_parameters
+
+        self._dmp_wrapped_module = module
         self._ddp_wrapped: bool = False
 
         if env is None:
@@ -374,7 +375,11 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
             # Allocate parameters and buffers if over 'meta' device.
             has_meta_param = False
             for name, param in module._parameters.items():
-                if isinstance(param, torch.Tensor) and param.device.type == "meta":
+                if (
+                    isinstance(param, torch.Tensor)
+                    and not isinstance(param, ShardedTensor)
+                    and param.device.type == "meta"
+                ):
                     module._parameters[name] = nn.Parameter(
                         torch.empty_like(param, device=self.device),
                         requires_grad=param.requires_grad,
@@ -482,22 +487,47 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         prefix: str = "",
         recurse: bool = True,
         strip_ddp: bool = True,
+        include_fused: bool = False,
     ) -> Iterator[Tuple[str, torch.nn.Parameter]]:
         if strip_ddp:
             module = get_unwrapped_module(module)
         if isinstance(module, ShardedModule):
-            yield from module.named_parameters(prefix, recurse)
+            if isinstance(module, ShardedEmbeddingBagCollection):
+                yield from module.named_parameters(
+                    prefix, recurse, include_fused=include_fused
+                )
+            else:
+                yield from module.named_parameters(
+                    prefix,
+                    recurse,
+                )
         else:
             yield from module.named_parameters(prefix, recurse=False)
             for name, child in module.named_children():
                 yield from self._named_parameters(
-                    child, append_prefix(prefix, name), recurse, strip_ddp
+                    child,
+                    append_prefix(prefix, name),
+                    recurse,
+                    strip_ddp,
+                    include_fused=include_fused,
                 )
 
     def named_parameters(
-        self, prefix: str = "", recurse: bool = True
+        self,
+        prefix: str = "",
+        recurse: bool = True,
+        # TODO remove when note needed
+        include_fused: bool = False,
     ) -> Iterator[Tuple[str, torch.nn.Parameter]]:
-        gen = self._named_parameters(self.module, prefix, recurse)
+        """
+        Args:
+            prefix (str):
+            recurse (bool):
+            include_fused (bool): flag for whether or not to include fused parameters. set to False for backward compatibility (of not returning fused)
+        """
+        gen = self._named_parameters(
+            self.module, prefix, recurse, include_fused=include_fused
+        )
         memo = set()
         for key, param in gen:
             if param in memo:

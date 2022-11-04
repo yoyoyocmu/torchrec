@@ -43,6 +43,7 @@ from torchrec.distributed.types import (
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig, EmbeddingBagConfig
 from torchrec.optim.apply_optimizer_in_backward import apply_optimizer_in_backward
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
+from torchrec.test_utils import assert_state_buffers_parameters_equal
 from typing_extensions import Protocol
 
 
@@ -337,7 +338,6 @@ def sharding_single_rank_test(
             sharders=sharders,
             device=ctx.device,
         )
-
         dense_optim = KeyedOptimizerWrapper(
             dict(local_model.named_parameters()),
             lambda params: torch.optim.SGD(params, lr=0.1),
@@ -345,6 +345,12 @@ def sharding_single_rank_test(
         local_opt = CombinedOptimizer([local_model.fused_optimizer, dense_optim])
 
         # Load model state from the global model.
+        assert_state_buffers_parameters_equal(
+            local_model,
+            global_model,
+            check_named_buffers=False,
+            check_named_parameters=False,
+        )
         copy_state_dict(local_model.state_dict(), global_model.state_dict())
 
         # Run a single training step of the sharded model.
