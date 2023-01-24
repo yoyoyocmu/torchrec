@@ -6,6 +6,7 @@ iopath
 numpy
 pandas
 pyre-extensions
+scikit-build
 tabulate
 torcharrow
 torchmetrics
