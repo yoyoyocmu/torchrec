@@ -19,6 +19,7 @@ from torchrec.datasets.criteo import DEFAULT_CAT_NAMES, DEFAULT_INT_NAMES
 from torchrec.datasets.random import RandomRecDataset
 from torchrec.distributed import TrainPipelineSparseDist
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.fused_embeddingbag import FusedEmbeddingBagCollection
 from torchrec.distributed.fbgemm_qcomm_codec import (
     CommType,
     get_qcomm_codecs_registry,
@@ -42,14 +43,14 @@ def _get_random_dataset(
         keys=DEFAULT_CAT_NAMES,
         batch_size=batch_size,
         hash_size=num_embeddings,
-        ids_per_feature=1,
+        ids_per_feature=3,
         num_dense=len(DEFAULT_INT_NAMES),
     )
 
 
 @record
 def main() -> None:
-    train()
+    train(num_embeddings=16)
 
 
 def train(
@@ -77,6 +78,8 @@ def train(
         over_arch_layer_sizes = [64, 1]
 
     # Init process_group , device, rank, backend
+    device = torch.device("cuda:0")
+    """
     rank = int(os.environ["LOCAL_RANK"])
     if torch.cuda.is_available():
         device: torch.device = torch.device(f"cuda:{rank}")
@@ -86,6 +89,7 @@ def train(
         device: torch.device = torch.device("cpu")
         backend = "gloo"
     dist.init_process_group(backend=backend)
+    """
 
     # Construct DLRM module
     eb_configs = [
@@ -98,8 +102,9 @@ def train(
         for feature_idx, feature_name in enumerate(DEFAULT_CAT_NAMES)
     ]
     dlrm_model = DLRM(
-        embedding_bag_collection=EmbeddingBagCollection(
-            tables=eb_configs, device=torch.device("meta")
+        embedding_bag_collection=FusedEmbeddingBagCollection(
+            tables=eb_configs,
+            optimizer_type=torch.optim.SGD, optimizer_kwargs={"lr": .01}
         ),
         dense_in_features=len(DEFAULT_INT_NAMES),
         dense_arch_layer_sizes=dense_arch_layer_sizes,
@@ -113,6 +118,7 @@ def train(
         train_model.model.sparse_arch.parameters(),
         {"lr": learning_rate},
     )
+    """
     qcomm_codecs_registry = (
         get_qcomm_codecs_registry(
             qcomms_config=QCommsConfig(
@@ -133,17 +139,23 @@ def train(
         # pyre-ignore
         sharders=[sharder],
     )
+    """
+    print(train_model)
+    return
+    model = torch.compile(fullgraph=True)(train_model.to(device))
 
     non_fused_optimizer = KeyedOptimizerWrapper(
         dict(in_backward_optimizer_filter(model.named_parameters())),
         lambda params: torch.optim.Adagrad(params, lr=learning_rate),
     )
+    """
     # Overlap comm/compute/device transfer during training through train_pipeline
     train_pipeline = TrainPipelineSparseDist(
         model,
         non_fused_optimizer,
         device,
     )
+    """
 
     # train model
     train_iterator = iter(
@@ -151,8 +163,14 @@ def train(
             num_embeddings=num_embeddings,
         )
     )
+
+    model(next(train_iterator).to(device))
+    model(next(train_iterator).to(device))
+
+    """
     for _ in tqdm(range(int(num_iterations)), mininterval=5.0):
         train_pipeline.progress(train_iterator)
+    """
 
 
 if __name__ == "__main__":
